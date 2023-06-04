@@ -1,4 +1,3 @@
-import chromadb
 from typing import List
 import spacy
 import os
@@ -10,114 +9,138 @@ import pandas as pd
 import docx2txt
 import pdfplumber
 from playwright.async_api import async_playwright
+from semantic_kernel.connectors.memory.chroma import ChromaMemoryStore
+from semantic_kernel.memory.memory_record import MemoryRecord
+from chromadb.config import Settings
 from bs4 import BeautifulSoup
+import logging
+import asyncio
+import sys
+
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 
 class Memories:
     def __init__(self, agent_name: str = "AGiXT", agent_config=None):
         self.agent_name = agent_name
-        self.nlp = self.load_spacy_model()
-        self.nlp.max_length = 99999999999999999999999
-        embedder = Embedding(agent_config)
-        self.embedding_function = embedder.embed
-        self.chunk_size = embedder.chunk_size
-        self.chroma_persist_dir = f"agents/{self.agent_name}/memories"
-        if not os.path.exists(self.chroma_persist_dir):
-            os.makedirs(self.chroma_persist_dir)
-        self.chroma_client = self.initialize_chroma_client()
-        self.collection = self.get_or_create_collection()
+        self.agent_config = agent_config
+        self.chroma_client = None
+        self.collection = None
+        self.nlp = None
+        self.chunk_size = 128
+        memories_dir = os.path.join(os.getcwd(), "agents", self.agent_name, "memories")
+        self.chroma_client = ChromaMemoryStore(
+            persist_directory=memories_dir,
+            client_settings=Settings(
+                chroma_db_impl="chromadb.db.duckdb.PersistentDuckDB",
+                persist_directory=memories_dir,
+                anonymized_telemetry=False,
+            ),
+        )
 
     def load_spacy_model(self):
-        try:
-            return spacy.load("en_core_web_sm")
-        except:
-            spacy.cli.download("en_core_web_sm")
-            return spacy.load("en_core_web_sm")
+        if not self.nlp:
+            try:
+                self.nlp = spacy.load("en_core_web_sm")
+            except:
+                spacy.cli.download("en_core_web_sm")
+                self.nlp = spacy.load("en_core_web_sm")
+        self.nlp.max_length = 99999999999999999999999
 
-    def initialize_chroma_client(self):
+    async def get_embedder(self):
+        embedder, chunk_size = await Embedding(
+            AGENT_CONFIG=self.agent_config
+        ).get_embedder()
+        return embedder, chunk_size
+
+    async def get_collection(self):
         try:
-            return chromadb.Client(
-                settings=chromadb.config.Settings(
-                    chroma_db_impl="duckdb+parquet",
-                    persist_directory=self.chroma_persist_dir,
-                    anonymized_telemetry=False,
-                )
+            memories_exist = await self.chroma_client.does_collection_exist_async(
+                "memories"
             )
+            if not memories_exist:
+                await self.chroma_client.create_collection_async(
+                    collection_name="memories"
+                )
+                memories = await self.chroma_client.get_collection_async(
+                    collection_name="memories"
+                )
+            else:
+                memories = await self.chroma_client.get_collection_async(
+                    collection_name="memories"
+                )
+            return memories
         except Exception as e:
             raise RuntimeError(f"Unable to initialize chroma client: {e}")
 
-    def get_or_create_collection(self):
-        try:
-            return self.chroma_client.get_collection(
-                name="memories", embedding_function=self.embedding_function
-            )
-        except ValueError:
-            print(f"Memories for {self.agent_name} do not exist. Creating...")
-            return self.chroma_client.create_collection(
-                name="memories", embedding_function=self.embedding_function
-            )
+    async def store_memory(
+        self, content: str, description: str = None, external_source_name: str = None
+    ):
+        embedder, chunk_size = await self.get_embedder()
+        collection = await self.get_collection()
+        record = MemoryRecord(
+            is_reference=False,
+            id=sha256((content + datetime.now().isoformat()).encode()).hexdigest(),
+            text=content,
+            timestamp=datetime.now().isoformat(),
+            description=description,
+            external_source_name=external_source_name,  # URL or File path
+            embedding=await embedder(content),
+        )
 
-    def generate_id(self, content: str, timestamp: str):
-        return sha256((content + timestamp).encode()).hexdigest()
-
-    def store_memory(self, id: str, content: str, metadatas: dict):
         try:
-            self.collection.add(
-                ids=id,
-                documents=content,
-                metadatas=metadatas,
+            await self.chroma_client.upsert_async(
+                collection_name="memories",
+                record=record,
             )
+            self.chroma_client._client.persist()
         except Exception as e:
-            print(f"Failed to store memory: {e}")
+            logging.info(f"Failed to store memory: {e}")
 
-    def store_result(self, task_name: str, result: str):
+    async def store_result(
+        self, task_name: str, result: str, external_source_name: str = None
+    ):
         if result:
-            timestamp = datetime.now()  # current time as datetime object
             if not isinstance(result, str):
                 result = str(result)
-            chunks = self.chunk_content(result, task_name)
+            chunks = await self.chunk_content(result, task_name)
             for chunk in chunks:
-                result_id = self.generate_id(chunk, timestamp.isoformat())
-                self.store_memory(
-                    result_id,
-                    chunk,
-                    {
-                        "task": task_name,
-                        "result": chunk,
-                        "timestamp": timestamp.isoformat(),
-                    },
+                await self.store_memory(
+                    content=chunk,
+                    description=task_name,
+                    external_source_name=external_source_name,
                 )
 
-    def context_agent(self, query: str, top_results_num: int) -> List[str]:
-        count = self.collection.count()
-        if count == 0:
+    async def context_agent(self, query: str, top_results_num: int) -> List[str]:
+        embedder, chunk_size = await self.get_embedder()
+        collection = await self.get_collection()
+        if collection == None:
             return []
-        results = self.collection.query(
-            query_texts=query,
-            n_results=min(top_results_num, count),
-            include=["metadatas"],
+        results = await self.chroma_client.get_nearest_matches_async(
+            collection_name="memories",
+            embedding=await embedder(query),
+            limit=top_results_num,
+            min_relevance_score=0.1,
         )
-        # Parse timestamps and sort the results by timestamp in descending order
-        sorted_results = sorted(
-            results["metadatas"][0],
-            key=lambda item: datetime.strptime(
-                item.get("timestamp") or "1970-01-01T00:00:00.000",
-                "%Y-%m-%dT%H:%M:%S.%f",
-            ),
-            reverse=True,
-        )
+        context = []
+        for memory, score in results:
+            context.append(memory._text)
+        trimmed_context = await self.trim_context(context)
+        logging.info(f"CONTEXT: {trimmed_context}")
+        context_str = "\n".join(trimmed_context)
+        response = f"Context: {context_str}\n\n"
+        return response
 
-        context = [item["result"] for item in sorted_results]
-        trimmed_context = self.trim_context(context)
-        print(f"CONTEXT: {trimmed_context}")
-        return "\n".join(trimmed_context)
-
-    def trim_context(self, context: List[str]) -> List[str]:
+    async def trim_context(self, context: List[str]) -> List[str]:
+        embedder, chunk_size = await self.get_embedder()
+        if not self.nlp:
+            self.load_spacy_model()
         trimmed_context = []
         total_tokens = 0
         for item in context:
             item_tokens = len(self.nlp(item))
-            if total_tokens + item_tokens <= self.chunk_size:
+            if total_tokens + item_tokens <= chunk_size:
                 trimmed_context.append(item)
                 total_tokens += item_tokens
             else:
@@ -126,6 +149,8 @@ class Memories:
 
     def get_keywords(self, query: str):
         """Extract keywords from a query using Spacy's part-of-speech tagging."""
+        if not self.nlp:
+            self.load_spacy_model()
         doc = self.nlp(query)
         keywords = [
             token.text for token in doc if token.pos_ in {"NOUN", "PROPN", "VERB"}
@@ -138,17 +163,22 @@ class Memories:
         score = sum(chunk_counter[keyword] for keyword in keywords)
         return score
 
-    def chunk_content(self, content: str, query: str, overlap: int = 2) -> List[str]:
-        content_chunks = []
+    async def chunk_content(
+        self, content: str, query: str, overlap: int = 2
+    ) -> List[str]:
+        embedder, chunk_size = await self.get_embedder()
+        if not self.nlp:
+            self.load_spacy_model()
         doc = self.nlp(content)
         sentences = list(doc.sents)
+        content_chunks = []
         chunk = []
         chunk_len = 0
         keywords = self.get_keywords(query)
 
         for i, sentence in enumerate(sentences):
             sentence_tokens = len(sentence)
-            if chunk_len + sentence_tokens > self.chunk_size and chunk:
+            if chunk_len + sentence_tokens > chunk_size and chunk:
                 chunk_text = " ".join(token.text for token in chunk)
                 content_chunks.append(
                     (self.score_chunk(chunk_text, keywords), chunk_text)
@@ -166,7 +196,7 @@ class Memories:
         content_chunks.sort(key=lambda x: x[0], reverse=True)
         return [chunk_text for score, chunk_text in content_chunks]
 
-    def read_file(self, file_path: str):
+    async def mem_read_file(self, file_path: str):
         try:
             # If file extension is pdf, convert to text
             if file_path.endswith(".pdf"):
@@ -183,7 +213,7 @@ class Memories:
             else:
                 with open(file_path, "r") as f:
                     content = f.read()
-            self.store_result(task_name=file_path, result=content)
+            await self.store_result(task_name=file_path, result=content)
             return True
         except:
             return False
@@ -210,7 +240,7 @@ class Memories:
                 text_content = soup.get_text()
                 text_content = " ".join(text_content.split())
                 if text_content:
-                    self.store_result(url, text_content)
+                    await self.store_result(url, text_content)
                 return text_content, link_list
         except:
             return None, None

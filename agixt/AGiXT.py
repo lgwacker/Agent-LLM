@@ -1,22 +1,36 @@
 import re
-import asyncio
+import os
 import regex
 import json
 import time
+import spacy
 from datetime import datetime
 from Agent import Agent
-from CustomPrompt import CustomPrompt
-from duckduckgo_search import ddg
+from Prompts import Prompts
+from extensions.searxng import searxng
 from urllib.parse import urlparse
+import logging
+from concurrent.futures import Future
 
 
 class AGiXT:
     def __init__(self, agent_name: str = "AGiXT"):
         self.agent_name = agent_name
         self.agent = Agent(self.agent_name)
+        self.agent_commands = self.agent.get_commands_string()
         self.stop_running_event = None
         self.browsed_links = []
         self.failures = 0
+        self.nlp = None
+
+    def load_spacy_model(self):
+        if not self.nlp:
+            try:
+                self.nlp = spacy.load("en_core_web_sm")
+            except:
+                spacy.cli.download("en_core_web_sm")
+                self.nlp = spacy.load("en_core_web_sm")
+        self.nlp.max_length = 99999999999999999999999
 
     def custom_format(self, string, **kwargs):
         if isinstance(string, list):
@@ -34,102 +48,156 @@ class AGiXT:
         result = re.sub(pattern, replace, string)
         return result
 
-    def format_prompt(
+    def get_step_response(self, chain_name, step_number):
+        try:
+            with open(os.path.join("chains", f"{chain_name}_responses.json"), "r") as f:
+                responses = json.load(f)
+            return responses.get(str(step_number))
+        except:
+            return ""
+
+    def get_step_content(self, chain_name, step_number, prompt_content):
+        new_prompt_content = {}
+        for arg, value in prompt_content.items():
+            if "{STEP" in value:
+                # get the response from the step number
+                step_response = self.get_step_response(
+                    chain_name=chain_name, step_number=step_number
+                )
+                # replace the {STEPx} with the response
+                value = value.replace(f"{{STEP{step_number}}}", step_response)
+            new_prompt_content[arg] = value
+        return new_prompt_content
+
+    async def format_prompt(
         self,
-        task: str,
+        task: str = "",
         top_results: int = 5,
         prompt="",
+        chain_name="",
+        step_number=0,
+        memories=None,
         **kwargs,
     ):
-        cp = CustomPrompt()
+        cp = Prompts()
         if prompt == "":
             prompt = task
         else:
-            prompt = cp.get_prompt(prompt_name=prompt, model=self.agent.AI_MODEL)
+            try:
+                prompt = cp.get_prompt(prompt_name=prompt, model=self.agent.AI_MODEL)
+            except:
+                prompt = prompt
         if top_results == 0:
             context = "None"
         else:
             try:
-                context = self.agent.memories.context_agent(
+                context = await memories.context_agent(
                     query=task, top_results_num=top_results
                 )
             except:
                 context = "None."
         command_list = self.agent.get_commands_string()
+        if chain_name != "":
+            try:
+                for arg, value in kwargs.items():
+                    if "{STEP" in value:
+                        # get the response from the step number
+                        step_response = self.get_step_response(
+                            chain_name=chain_name, step_number=step_number
+                        )
+                        # replace the {STEPx} with the response
+                        value = value.replace(f"{{STEP{step_number}}}", step_response)
+                        kwargs[arg] = value
+            except:
+                logging.info("No args to replace.")
+            if "{STEP" in prompt:
+                step_response = self.get_step_response(
+                    chain_name=chain_name, step_number=step_number
+                )
+                prompt = prompt.replace(f"{{STEP{step_number}}}", step_response)
+            if "{STEP" in task:
+                step_response = self.get_step_response(
+                    chain_name=chain_name, step_number=step_number
+                )
+                task = task.replace(f"{{STEP{step_number}}}", step_response)
         formatted_prompt = self.custom_format(
-            prompt,
+            string=prompt,
             task=task,
             agent_name=self.agent_name,
-            COMMANDS=command_list,
+            COMMANDS=self.agent_commands,
             context=context,
             command_list=command_list,
             date=datetime.now().strftime("%B %d, %Y %I:%M %p"),
             **kwargs,
         )
-        if command_list == "No commands.":
-            formatted_prompt = formatted_prompt.replace(
-                "Commands Available To Complete Task:", ""
-            )
-        tokens = len(self.agent.memories.nlp(formatted_prompt))
+
+        if not self.nlp:
+            self.load_spacy_model()
+        tokens = len(self.nlp(formatted_prompt))
+        logging.info(f"FORMATTED PROMPT: {formatted_prompt}")
         return formatted_prompt, prompt, tokens
 
-    def run(
+    async def run(
         self,
-        task: str,
+        task: str = "",
         prompt: str = "",
         context_results: int = 5,
         websearch: bool = False,
         websearch_depth: int = 3,
-        async_exec: bool = False,
         learn_file: str = "",
+        chain_name: str = "",
+        step_number: int = 0,
         **kwargs,
     ):
+        logging.info(f"KWARGS: {kwargs}")
+        memories = self.agent.get_memories()
         if learn_file != "":
-            learning_file = self.agent.memories.read_file(file_path=learn_file)
+            learning_file = await memories.mem_read_file(file_path=learn_file)
             if learning_file == False:
                 return "Failed to read file."
-        formatted_prompt, unformatted_prompt, tokens = self.format_prompt(
+        formatted_prompt, unformatted_prompt, tokens = await self.format_prompt(
             task=task,
             top_results=context_results,
             prompt=prompt,
+            chain_name=chain_name,
+            step_number=step_number,
+            memories=memories,
             **kwargs,
         )
         if websearch:
-            if async_exec:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                loop.run_until_complete(
-                    self.websearch_agent(task=task, depth=websearch_depth)
-                )
-            else:
-                self.websearch_agent(task=task, depth=websearch_depth)
+            await self.websearch_agent(task=task, depth=websearch_depth)
         try:
-            self.response = self.agent.instruct(formatted_prompt, tokens=tokens)
+            # Workaround for non-threaded providers
+            run_response = self.agent.instruct(formatted_prompt, tokens=tokens)
+            self.response = (
+                run_response.result()
+                if isinstance(run_response, Future)
+                else run_response
+            )
         except Exception as e:
-            print(f"Error: {e}")
-            print(f"PROMPT CONTENT: {formatted_prompt}")
-            print(f"TOKENS: {tokens}")
+            logging.info(f"Error: {e}")
+            logging.info(f"PROMPT CONTENT: {formatted_prompt}")
+            logging.info(f"TOKENS: {tokens}")
             self.failures += 1
             if self.failures == 5:
                 self.failures == 0
-                print("Failed to get a response 5 times in a row.")
+                logging.info("Failed to get a response 5 times in a row.")
                 return None
-            print(f"Retrying in 10 seconds...")
+            logging.info(f"Retrying in 10 seconds...")
             time.sleep(10)
             if context_results > 0:
                 context_results = context_results - 1
-            self.response = self.run(
+            self.response = await self.run(
                 task=task,
                 prompt=prompt,
                 context_results=context_results,
-                async_exec=async_exec,
                 **kwargs,
             )
 
         # Handle commands if the prompt contains the {COMMANDS} placeholder
         # We handle command injection that DOESN'T allow command execution by using {command_list} in the prompt
         if "{COMMANDS}" in unformatted_prompt:
-            execution_response = self.execution_agent(
+            execution_response = await self.execution_agent(
                 execution_response=self.response,
                 task=task,
                 context_results=context_results,
@@ -152,21 +220,20 @@ class AGiXT:
             except:
                 return_response = self.response
             self.response = return_response
-        print(f"Response: {self.response}")
+        logging.info(f"Response: {self.response}")
         if self.response != "" and self.response != None:
             try:
-                self.agent.memories.store_result(task, self.response)
+                await memories.store_result(task, self.response)
             except:
                 pass
             self.agent.log_interaction("USER", task)
             self.agent.log_interaction(self.agent_name, self.response)
         return self.response
 
-    def smart_instruct(
+    async def smart_instruct(
         self,
         task: str = "Write a tweet about AI.",
         shots: int = 3,
-        async_exec: bool = False,
         learn_file: str = "",
         objective: str = None,
         **kwargs,
@@ -174,7 +241,7 @@ class AGiXT:
         answers = []
         # Do multi shots of prompt to get N different answers to be validated
         answers.append(
-            self.run(
+            await self.run(
                 task=task,
                 prompt="SmartInstruct-StepByStep"
                 if objective == None
@@ -183,7 +250,6 @@ class AGiXT:
                 websearch=True,
                 websearch_depth=3,
                 shots=shots,
-                async_exec=async_exec,
                 learn_file=learn_file,
                 objective=objective,
                 **kwargs,
@@ -192,7 +258,7 @@ class AGiXT:
         if shots > 1:
             for i in range(shots - 1):
                 answers.append(
-                    self.run(
+                    await self.run(
                         task=task,
                         prompt="SmartInstruct-StepByStep"
                         if objective == None
@@ -206,25 +272,25 @@ class AGiXT:
         answer_str = ""
         for i, answer in enumerate(answers):
             answer_str += f"Answer {i + 1}:\n{answer}\n\n"
-        researcher = self.run(
+        researcher = await self.run(
             task=answer_str,
             prompt="SmartInstruct-Researcher",
             shots=shots,
             **kwargs,
         )
-        resolver = self.run(
+        resolver = await self.run(
             task=researcher,
             prompt="SmartInstruct-Resolver",
             shots=shots,
             **kwargs,
         )
-        execution_response = self.run(
+        execution_response = await self.run(
             task=task,
             prompt="SmartInstruct-Execution",
             previous_response=resolver,
             **kwargs,
         )
-        clean_response_agent = self.run(
+        clean_response_agent = await self.run(
             task=task,
             prompt="SmartInstruct-CleanResponse"
             if objective == None
@@ -236,24 +302,22 @@ class AGiXT:
         )
         return clean_response_agent
 
-    def smart_chat(
+    async def smart_chat(
         self,
         task: str = "Write a tweet about AI.",
         shots: int = 3,
-        async_exec: bool = False,
         learn_file: str = "",
         **kwargs,
     ):
         answers = []
         answers.append(
-            self.run(
+            await self.run(
                 task=task,
                 prompt="SmartChat-StepByStep",
                 context_results=6,
                 websearch=True,
                 websearch_depth=3,
                 shots=shots,
-                async_exec=async_exec,
                 learn_file=learn_file,
                 **kwargs,
             )
@@ -262,7 +326,7 @@ class AGiXT:
         if shots > 1:
             for i in range(shots - 1):
                 answers.append(
-                    self.run(
+                    await self.run(
                         task=task,
                         prompt="SmartChat-StepByStep",
                         context_results=6,
@@ -273,21 +337,21 @@ class AGiXT:
         answer_str = ""
         for i, answer in enumerate(answers):
             answer_str += f"Answer {i + 1}:\n{answer}\n\n"
-        researcher = self.run(
+        researcher = await self.run(
             task=answer_str,
             prompt="SmartChat-Researcher",
             context_results=6,
             shots=shots,
             **kwargs,
         )
-        resolver = self.run(
+        resolver = await self.run(
             task=researcher,
             prompt="SmartChat-Resolver",
             context_results=6,
             shots=shots,
             **kwargs,
         )
-        clean_response_agent = self.run(
+        clean_response_agent = await self.run(
             task=task,
             prompt="SmartChat-CleanResponse",
             resolver_response=resolver,
@@ -296,7 +360,9 @@ class AGiXT:
         return clean_response_agent
 
     # Worker Sub-Agents
-    def validation_agent(self, task, execution_response, context_results, **kwargs):
+    async def validation_agent(
+        self, task, execution_response, context_results, **kwargs
+    ):
         try:
             pattern = regex.compile(r"\{(?:[^{}]|(?R))*\}")
             cleaned_json = pattern.findall(execution_response)
@@ -307,21 +373,21 @@ class AGiXT:
             response = json.loads(cleaned_json)
             return response
         except:
-            print("INVALID JSON RESPONSE")
-            print(execution_response)
-            print("... Trying again.")
+            logging.info("INVALID JSON RESPONSE")
+            logging.info(execution_response)
+            logging.info("... Trying again.")
             if context_results != 0:
                 context_results = context_results - 1
             else:
                 context_results = 0
-            execution_response = self.run(
+            execution_response = await self.run(
                 task=task, context_results=context_results, **kwargs
             )
-            return self.validation_agent(
+            return await self.validation_agent(
                 task, execution_response, context_results, **kwargs
             )
 
-    def revalidation_agent(
+    async def revalidation_agent(
         self,
         task,
         command_name,
@@ -330,10 +396,10 @@ class AGiXT:
         context_results,
         **kwargs,
     ):
-        print(
+        logging.info(
             f"Command {command_name} did not execute as expected with args {command_args}. Trying again.."
         )
-        revalidate = self.run(
+        revalidate = await self.run(
             task=task,
             prompt="ValidationFailed",
             command_name=command_name,
@@ -341,10 +407,12 @@ class AGiXT:
             command_output=command_output,
             **kwargs,
         )
-        return self.execution_agent(revalidate, task, context_results, **kwargs)
+        return await self.execution_agent(revalidate, task, context_results, **kwargs)
 
-    def execution_agent(self, execution_response, task, context_results, **kwargs):
-        validated_response = self.validation_agent(
+    async def execution_agent(
+        self, execution_response, task, context_results, **kwargs
+    ):
+        validated_response = await self.validation_agent(
             task, execution_response, context_results, **kwargs
         )
         try:
@@ -359,11 +427,11 @@ class AGiXT:
                             command_name = available_command["name"]
                             try:
                                 # Check if the command is a valid command in the self.avent.available_commands list
-                                command_output = self.agent.execute(
+                                command_output = await self.agent.execute(
                                     command_name, command_args
                                 )
-                                print("Running Command Execution Validation...")
-                                validate_command = self.run(
+                                logging.info("Running Command Execution Validation...")
+                                validate_command = await self.run(
                                     task=task,
                                     prompt="Validation",
                                     command_name=command_name,
@@ -371,32 +439,31 @@ class AGiXT:
                                     command_output=command_output,
                                     **kwargs,
                                 )
+                                if validate_command.startswith("Yes"):
+                                    # Failed command execution
+                                    return await self.revalidation_agent(
+                                        task=task,
+                                        command_name=command_name,
+                                        command_args=command_args,
+                                        command_output=command_output,
+                                        context_results=context_results,
+                                        **kwargs,
+                                    )
+                                else:
+                                    # Successful command execution
+                                    logging.info(
+                                        f"Command {command_name} executed successfully with args {command_args}. Command Output: {command_output}"
+                                    )
+                                    response = f"\nExecuted Command:{command_name} with args {command_args}.\nCommand Output: {command_output}\n"
+                                    return response
                             except:
-                                return self.revalidation_agent(
-                                    task,
-                                    command_name,
-                                    command_args,
-                                    command_output,
-                                    **kwargs,
-                                )
-
-                            if validate_command.startswith("Y"):
-                                print(
-                                    f"Command {command_name} executed successfully with args {command_args}."
-                                )
-                                response = f"\nExecuted Command:{command_name} with args {command_args}.\nCommand Output: {command_output}\n"
-                                return response
-                            else:
-                                revalidate = self.run(
+                                return await self.revalidation_agent(
                                     task=task,
-                                    prompt="ValidationFailed",
                                     command_name=command_name,
                                     command_args=command_args,
                                     command_output=command_output,
+                                    context_results=context_results,
                                     **kwargs,
-                                )
-                                return self.execution_agent(
-                                    execution_response, task, context_results, **kwargs
                                 )
                 else:
                     if command_name == "None.":
@@ -404,13 +471,15 @@ class AGiXT:
                     else:
                         return f"\Command not recognized: {command_name} ."
         except:
-            print("\nERROR IN EXECUTION_AGENT, validated_response:\n")
-            print(validated_response)
+            logging.info("\nERROR IN EXECUTION_AGENT, validated_response:\n")
+            logging.info(validated_response)
             return "\nNo commands were executed.\n"
 
     async def websearch_agent(
         self, task: str = "What are the latest breakthroughs in AI?", depth: int = 3
     ):
+        memories = self.agent.get_memories()
+
         async def resursive_browsing(task, links):
             try:
                 words = links.split()
@@ -422,25 +491,28 @@ class AGiXT:
             if links is not None:
                 for link in links:
                     if "href" in link:
-                        url = link["href"]
+                        try:
+                            url = link["href"]
+                        except:
+                            url = link
                     else:
                         url = link
                     url = re.sub(r"^.*?(http)", r"http", url)
                     # Check if url is an actual url
                     if url.startswith("http"):
-                        print(f"Scraping: {url}")
+                        logging.info(f"Scraping: {url}")
                         if url not in self.browsed_links:
                             self.browsed_links.append(url)
                             (
                                 collected_data,
                                 link_list,
-                            ) = await self.agent.memories.read_website(url)
+                            ) = await memories.read_website(url)
                             if link_list is not None:
                                 if len(link_list) > 0:
                                     if len(link_list) > 5:
                                         link_list = link_list[:3]
                                     try:
-                                        pick_a_link = self.run(
+                                        pick_a_link = await self.run(
                                             task=task,
                                             prompt="Pick-a-Link",
                                             links=link_list,
@@ -448,12 +520,25 @@ class AGiXT:
                                         if not pick_a_link.startswith("None"):
                                             await resursive_browsing(task, pick_a_link)
                                     except:
-                                        print(f"Issues reading {url}. Moving on...")
+                                        logging.info(
+                                            f"Issues reading {url}. Moving on..."
+                                        )
 
-        results = self.run(task=task, prompt="WebSearch")
+        results = await self.run(task=task, prompt="WebSearch")
         results = results.split("\n")
         for result in results:
             search_string = result.lstrip("0123456789. ")
-            links = ddg(search_string, max_results=depth)
+            try:
+                searx_server = self.agent.PROVIDER_SETTINGS["SEARXNG_INSTANCE_URL"]
+            except:
+                searx_server = ""
+            try:
+                links = await searxng(SEARXNG_INSTANCE_URL=searx_server).search(
+                    search_string
+                )
+                if len(links) > depth:
+                    links = links[:depth]
+            except:
+                links = None
             if links is not None:
                 await resursive_browsing(task, links)
